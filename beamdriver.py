@@ -1,4 +1,4 @@
-from pcaspy import Driver
+from pcaspy import Driver, SimpleServer
 from cheetah.particles import ParticleBeam
 from cheetah.accelerator import Segment, Screen
 import numpy as np
@@ -7,10 +7,148 @@ from lcls_tools.common.data.model_general_calcs import bdes_to_kmod, kmod_to_bde
 from scipy.stats import cauchy
 import pprint
 import math
+from p4p.server.thread import SharedPV
+from p4p.nt import NTScalar, NTNDArray
+import p4p
+import p4p.server
+from typing import Dict, Callable, Any
+
+class SimServer(SimpleServer):
+    
+    class UpdateHandler:
+        """
+        Handler for PV writes. Invokes the update callback
+        """
+        def __init__(self, server):
+            self.server = server
+
+        def put(self, pv, op):
+            pv.post(op.value())
+            op.done()
+            if self.server._callback:
+                self.server._callback(op.name(), op.value())
+
+    
+    """
+    Extended form of SimpleServer from pcaspy. Also exposes PVs via the PVA protocol
+    using the appropriate NT types.
+    """
+    def __init__(self, pvdb: dict, prefix: str = ''):
+        self._pva: Dict[str, SharedPV] = {}
+        self._callback = None
+        self._db = pvdb
+
+        # Create CA PVs
+        self.createPV(prefix, pvdb)
+        
+        # Create PVA PVs
+        for k, v in pvdb.items():
+            self._pva.update(self._build_pv(k, v))
+        
+        super().__init__()
+    
+    def set_update_callback(self, callable: Callable[[str, Any], None]):
+        """
+        Sets the callback to be called every 0.1s in the processing loop (corresponds to fastest EPICS processing time)
+        
+        Parameters
+        ----------
+        callable : Callable
+            Method to use, or none to clear
+        """
+        self._callback = callable
+    
+    def run(self):
+        self._server = p4p.server.Server(providers=[self._pva])
+        while True:
+            self.process(0.1)
+
+    @property
+    def pva_pvs(self) -> Dict[str, SharedPV]:
+        return self._pva
+    
+    @property
+    def pvdb(self) -> dict:
+        return self.pvdb
+    
+    def _type_desc(self, t) -> str:
+        """
+        Returns the type description of t for use with NTScalar and friends
+        
+        Parameters
+        ----------
+        t : Any
+            object to describe
+        """
+        if isinstance(t, int):
+            return 'i'
+        elif isinstance(t, float):
+            return 'd'
+        elif isinstance(t, bool):
+            return '?'
+        elif isinstance(t, str):
+            return 's'
+        else:
+            raise Exception(f'Unsupported type {type(t)}')
+
+    def _build_pv(self, name: str, desc: dict) -> Dict[str, SharedPV]:
+        r = {}
+        if not 'type' in desc:
+            desc['type'] = 'float'
+
+        match desc['type']:
+            case 'enum':
+                nt = NTScalar('i', control=True, display=True, valueAlarm=True)
+                default = 0
+            case 'longin':
+                nt = NTScalar('i', control=True, display=True, valueAlarm=True)
+                default = 0
+            case 'int':
+                nt = NTScalar('i', control=True, display=True, valueAlarm=True)
+                default = 0
+            case 'float':
+                nt = NTScalar('d', control=True, display=True, valueAlarm=True)
+                default = 0.0
+            case _:
+                raise Exception(f'Unhandled type "{desc["type"]}"')
+
+        # Special control fields
+        controls = ['enums', 'type', 'value', 'count']
+
+        # Build generic fields
+        for k, v in desc.items():
+            if k in controls:
+                continue # Skip special values
+
+            # Build a PV for each field
+            r[f'{name}.{k.upper()}'] = SharedPV(
+                nt=NTScalar(self._type_desc(v)),
+                initial=v,
+                handler=SimServer.UpdateHandler(self)
+            )
+            print(f'Initial {name}.{k.upper()}={v}')
+
+        # Add VAL field toos
+        r[f'{name}.VAL'] = SharedPV(
+            nt=nt,
+            initial=default,
+            handler=SimServer.UpdateHandler(self),
+        )
+
+        # Stupid alias
+        r[f'{name}'] = r[f'{name}.VAL']
+
+        return r
+    
+    def set_pv(self, name: str, value):
+        self._pva[name].post(value)
+
 # TODO: set defaults for all tcav enum pvs
 #  
 class SimDriver(Driver):
-    def __init__(self, screen: str,
+    def __init__(self,
+                 server: SimServer,
+                 screen: str,
                  devices: dict,
                  design_incoming_beam:dict = None,
                  particle_beam: ParticleBeam = None,
@@ -19,8 +157,7 @@ class SimDriver(Driver):
                  enum_init_values: dict = None):
         super().__init__()
 
-
-
+        self.server = server
         self.devices = devices
         #pprint.pprint(devices)
         '''
@@ -76,10 +213,30 @@ class SimDriver(Driver):
 
         self.set_defaults_for_ctrl(0)
         self.set_defaults_for_pneumatic()
+        
+        # Do an initial iteration with default values
+        self._on_update(None, None)
+        self.server.set_update_callback(self._on_update)
+
+    def _on_update(self, reason: str | None, value):
+        # If we have a reason, we've been invoked by PVA callback handler
+        if reason:
+            self.write(reason, value)
+
+        # Force read new values to update monitors
+        for k in self.server.pva_pvs.keys():
+            try:
+                self.read(k)
+            except:
+                pass
+    
+    def set_param(self, reason, value):
+        self.setParam(reason, value)
+        self.server.set_pv(reason, value)
 
     def set_defaults(self, enum_init_values):
         for pv, init_value in enum_init_values.items():
-            self.setParam(pv, init_value)
+            self.set_param(pv, init_value)
     
     def set_defaults_for_ctrl(self,default_value: int )->None:
         """Sets default quad ctrl value to ready state"""
@@ -87,7 +244,7 @@ class SimDriver(Driver):
         for key in keys:
             if 'QUAD' in key:
                 ctrl_pv = key + ":CTRL"
-                self.setParam(ctrl_pv, default_value)
+                self.set_param(ctrl_pv, default_value)
 
     def set_defaults_for_pneumatic(self):
         screens = { element.name: element.is_active for element
@@ -100,7 +257,7 @@ class SimDriver(Driver):
             position = 1 if screens[screen] else 0
             print(f"{name} : {position}")
             pv = name + ":PNEUMATIC"
-            self.setParam(pv , position)
+            self.set_param(pv , position)
             self.move_screen(name, screens[screen])
 
     def madname_to_control(self,madname):
@@ -295,7 +452,7 @@ class SimDriver(Driver):
         elif 'PNEUMATIC' in reason:
             madname = self.devices[self.screen]["madname"]           
             value = self.check_screen(madname)
-            print(value)      
+            print(value)
         elif 'QUAD' in reason and 'BCTRL' in reason or 'BACT' in reason:
             quad_name = reason.rsplit(':',1)[0]
             madname = self.devices[quad_name]["madname"]
@@ -319,6 +476,9 @@ class SimDriver(Driver):
             value = [self.sim_beam.sigma_x,self.sim_beam.sigma_y]
         else:
             value = self.getParam(reason)
+
+        # Post PVA changes
+        self.server.set_pv(reason, value)
         return value
 
     def write(self, reason, value):
@@ -329,7 +489,7 @@ class SimDriver(Driver):
         elif 'QUAD' in reason and 'BACT' in reason:
             pass
         elif 'QUAD' in reason:
-            self.setParam(reason,value)
+            self.set_param(reason,value)
         elif 'PNEUMATIC' in reason:
             screen = reason.rsplit(':',1)[0]
             madname = self.devices[screen]["madname"]
@@ -347,6 +507,7 @@ class SimDriver(Driver):
             self.set_tcav_phase(madname,value)
         elif 'VIRT:BEAM:RESET_SIM' == reason:
             self.reset_sim()
+        self._on_update(None, None)
 
 
 #TODO: add functionality to pop screens in and out

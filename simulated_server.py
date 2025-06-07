@@ -1,6 +1,5 @@
-from pcaspy import SimpleServer
 from cheetah.particles import ParticleBeam
-from beamdriver import SimDriver
+from beamdriver import SimDriver, SimServer
 from cheetah.accelerator import Segment 
 import torch
 from utils.load_yaml import load_relevant_controls
@@ -21,13 +20,14 @@ custom_pvs = {'VIRT:BEAM:EMITTANCES': {'type':'float', 'count': 2},
 }
 PVDB.update(custom_pvs)
 pprint.pprint(PVDB)
-server = SimpleServer()
-server.createPV('', PVDB)
-driver = SimDriver(screen=screen_name,
-                   devices=devices,
-                   design_incoming_beam=design_incoming_beam,
-                   lattice_file=lcls_lattice)
+server = SimServer(PVDB)
+driver = SimDriver(
+    server=server,
+    screen=screen_name,
+    devices=devices,
+    design_incoming_beam=design_incoming_beam,
+    lattice_file=lcls_lattice
+)
 
 print('Starting simulated server')
-while True:
-    server.process(0.1)
+server.run()
