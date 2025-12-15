@@ -47,7 +47,7 @@ def get_virtual_accelerator(name, monitor_overview=False, measurement_noise_leve
         )
 
         mapping_file = os.path.join(FILEPATH, "mappings", "lcls_elements.csv")
-        lattice_file = os.path.join(LCLS_LATTICE, "sc_diag0.json")
+        lattice_file = os.path.join(LCLS_LATTICE,"cheetah", "sc_diag0.json")
         subcell_dest = None
         
     elif name in ("nc_injector", 'nc_hxr'):
@@ -59,7 +59,7 @@ def get_virtual_accelerator(name, monitor_overview=False, measurement_noise_leve
         incoming_beam.particle_charges = torch.tensor(1.0)
 
         mapping_file = os.path.join(FILEPATH, "mappings", "lcls_elements.csv") 
-        lattice_file = os.path.join(LCLS_LATTICE,"nc_hxr.json")
+        lattice_file = os.path.join(LCLS_LATTICE,"cheetah","nc_hxr.json")
 
         if name == "nc_injector":
             subcell_dest = 'otr2'
